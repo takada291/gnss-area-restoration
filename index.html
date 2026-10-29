@@ -120,7 +120,7 @@
 <body>
 
     <div class="container">
-        <h1>GNSS区域復元 v0.1</h1>
+        <h1>GNSS区域復元 v0.2</h1>
         
         <div class="api-note">
             <strong>APIキー設定（初回のみ）</strong><br>
@@ -206,7 +206,7 @@
                     osc.connect(gain);
                     gain.connect(audioCtx.destination);
                     osc.type = 'sine';
-                    osc.frequency.value = 1000; // 少し高めで澄んだ音
+                    osc.frequency.value = 1000; 
                     gain.gain.setValueAtTime(0.1, audioCtx.currentTime + delay);
                     osc.start(audioCtx.currentTime + delay);
                     osc.stop(audioCtx.currentTime + delay + 0.1);
@@ -224,6 +224,59 @@
             }
         }
 
+        // 3.6最優先＆90秒タイムアウトの堅牢なフォールバック機構
+        const MODEL_CANDIDATES = ["gemini-3.6-flash", "gemini-2.5-flash"];
+
+        async function fetchWithTimeout(url, options, timeoutMs = 90000) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try { return await fetch(url, { ...options, signal: controller.signal }); } 
+            finally { clearTimeout(timer); }
+        }
+
+        async function callGeminiWithFallback(apiKey, basePayload, onStatusUpdate) {
+            let lastErrorMsg = "";
+            for (const modelName of MODEL_CANDIDATES) {
+                if (onStatusUpdate) onStatusUpdate(modelName);
+                const isGemini3 = modelName.startsWith("gemini-3");
+                const payloadWithThinking = JSON.parse(JSON.stringify(basePayload));
+                if (isGemini3) {
+                    payloadWithThinking.generationConfig = {
+                        ...(payloadWithThinking.generationConfig || {}),
+                        thinkingConfig: { thinkingLevel: "LOW" }
+                    };
+                }
+                try {
+                    let response = await fetchWithTimeout(
+                        `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+                        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payloadWithThinking) },
+                        90000
+                    );
+                    let data = await response.json();
+                    if (data.error && response.status === 400 && isGemini3) {
+                        response = await fetchWithTimeout(
+                            `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+                            { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(basePayload) },
+                            90000
+                        );
+                        data = await response.json();
+                    }
+                    if (data.error) {
+                        lastErrorMsg = `[${modelName}] ${data.error.message}`;
+                        continue;
+                    }
+                    if (data.candidates && data.candidates[0] && data.candidates[0].content) {
+                        const parts = data.candidates[0].content.parts || [];
+                        const answerPart = parts.find(p => typeof p.text === 'string' && !p.thought) || parts.find(p => typeof p.text === 'string');
+                        if (answerPart) { return { text: answerPart.text, usedModel: modelName }; }
+                    }
+                } catch (err) {
+                    lastErrorMsg = `[${modelName}] ${err.name === 'AbortError' ? 'タイムアウト(90秒超過)' : err.message}`;
+                }
+            }
+            throw new Error(lastErrorMsg || "AIモデルでの通信に失敗しました。APIキーや利用制限をご確認ください。");
+        }
+
         // SVG要素を生成するヘルパー関数
         function createSVGElement(tag, attrs) {
             const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
@@ -231,24 +284,6 @@
             return el;
         }
 
-        async function findAvailableModel(apiKey) {
-            try {
-                loadingDetail.innerText = "最適なAIモデルを探しています...";
-                const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`); 
-                if (!response.ok) throw new Error("モデルリストの取得に失敗"); 
-                const data = await response.json(); 
-                const models = data.models || []; 
-                const capableModels = models.filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes("generateContent") && !m.name.includes("gemini-2.0") ); 
-                let bestModel = capableModels.find(m => m.name.includes("gemini-1.5-pro")); 
-                if (!bestModel) bestModel = capableModels.find(m => m.name.includes("gemini-1.5-flash")); 
-                if (!bestModel && capableModels.length > 0) bestModel = capableModels[0]; 
-                if (bestModel) return bestModel.name.replace("models/", ""); 
-                return "gemini-1.5-flash"; 
-            } catch (e) { 
-                return "gemini-1.5-flash"; 
-            } 
-        } 
-        
         async function fileToGenerativePart(file) { 
             return new Promise((resolve) => { 
                 const reader = new FileReader(); 
@@ -331,7 +366,6 @@
             for(let i = 0; i < pts.length; i++) {
                 let p1 = pts[i];
                 let p2 = pts[(i + 1) % pts.length];
-                // 測量座標でも数学座標でも、閉合多角形の面積の絶対値は同一
                 doubleArea += (p1.x * p2.y - p2.x * p1.y); 
             }
             let area = Math.abs(doubleArea) / 2;
@@ -344,7 +378,7 @@
             // --- SVG描画 (Xを縦軸、Yを横軸としてマッピング) ---
             const svgW = 800;
             const svgH = 800;
-            const margin = 80; // ポップアップが見切れないように少し広めにとる
+            const margin = 80; 
             
             const svg = createSVGElement('svg', {viewBox: `0 0 ${svgW} ${svgH}`, width: '100%'});
 
@@ -356,19 +390,15 @@
             let spanX = maxX - minX || 1;
             let spanY = maxY - minY || 1;
             
-            // スケール計算（測量XがSVGのY、測量YがSVGのX）
-            // ※測量座標のXは「北」が正なので、画面上ではYを反転させて上にいくほどXが大きくなるようにする
             let scale = Math.min((svgW - margin * 2) / spanY, (svgH - margin * 2) / spanX);
             
-            // パス文字列の生成
             let pathD = pts.map((p, i) => {
                 let cx = margin + (p.y - minY) * scale;
-                let cy = svgH - margin - (p.x - minX) * scale; // Xを反転
-                p.cx = cx; p.cy = cy; // 点の描画用に保存
+                let cy = svgH - margin - (p.x - minX) * scale; 
+                p.cx = cx; p.cy = cy; 
                 return `${i === 0 ? 'M' : 'L'}${cx},${cy}`;
-            }).join(' ') + ' Z'; // 最後を閉じる
+            }).join(' ') + ' Z'; 
             
-            // 塗りつぶしのパス
             const path = createSVGElement('path', {
                 d: pathD, 
                 fill: 'rgba(39, 174, 96, 0.15)', 
@@ -378,19 +408,14 @@
             });
             svg.appendChild(path);
             
-            // 各頂点（変化点）とポップアップの描画
             pts.forEach(p => {
                 const group = createSVGElement('g', {style: 'cursor: pointer;'});
                 
-                // 点
                 const circle = createSVGElement('circle', {
                     cx: p.cx, cy: p.cy, r: 6, fill: '#e74c3c', stroke: '#fff', 'stroke-width': 2
                 });
                 
-                // ポップアップグループ (初期は非表示)
                 const popup = createSVGElement('g', {display: 'none'});
-                
-                // 文字列の長さに合わせて背景の幅を大まかに調整
                 const textWidth = p.point.length * 9 + 16; 
                 
                 const bg = createSVGElement('rect', {
@@ -411,7 +436,6 @@
                 group.appendChild(circle);
                 group.appendChild(popup);
                 
-                // タップ/クリックで表示切替
                 group.addEventListener('click', () => {
                     let isVisible = popup.getAttribute('display') !== 'none';
                     popup.setAttribute('display', isVisible ? 'none' : 'block');
@@ -437,11 +461,8 @@
             btn.disabled = true; loading.style.display = 'block'; resultArea.style.display = 'none'; 
             
             try { 
-                const modelName = await findAvailableModel(apiKey); 
-                loadingDetail.innerText = `画像読取・復元中 (${modelName}を使用)...`;
-
-                const genAI = new GoogleGenerativeAI(apiKey);
-                const model = genAI.getGenerativeModel({ model: modelName });
+                let activeModelName = "準備中";
+                loadingDetail.innerText = "最適なAIモデルを探しています...";
                 
                 const prompt = `
                     あなたは測量データのデジタル化を行うアシスタントです。
@@ -466,9 +487,27 @@
                 `;
 
                 const imageParts = await Promise.all([...files].map(fileToGenerativePart));
-                const result = await model.generateContent([prompt, ...imageParts]);
-                let text = await result.response.text();
-                text = text.replace(/```json/g, '').replace(/```/g, '').trim();
+                
+                const basePayload = {
+                    contents: [
+                        {
+                            parts: [
+                                { text: prompt },
+                                ...imageParts
+                            ]
+                        }
+                    ],
+                    generationConfig: {
+                        response_mime_type: "application/json"
+                    }
+                };
+
+                const res = await callGeminiWithFallback(apiKey, basePayload, (m) => {
+                    activeModelName = m;
+                    loadingDetail.innerText = `画像読取・復元中 (${activeModelName}を使用)...`;
+                });
+
+                let text = res.text.replace(/```json/g, '').replace(/```/g, '').trim();
                 
                 currentData = JSON.parse(text);
                 
